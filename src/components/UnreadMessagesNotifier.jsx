@@ -1,27 +1,48 @@
 // src/components/UnreadMessagesNotifier.jsx
 import { useEffect, useRef } from "react";
+import { useLocation, useNavigate } from "react-router-dom";
 import { toast } from "react-toastify";
-import { useNavigate } from "react-router-dom";
 import api from "../api";
 import { ACCESS_TOKEN } from "../constants";
 
 const POLL_MS = 5000;
-const DEBUG = false; // na testy ustaw true
+const DEBUG = false;
+
+// -------- helpers --------
+const norm = (s) => (s ?? "").toString().trim().toLowerCase();
+
+const getToken = () => localStorage.getItem(ACCESS_TOKEN) || null;
+
+// proste sprawdzenie JWT (bez weryfikacji podpisu) – wystarczy na FE
+const parseJwt = (t) => {
+  try {
+    const base = t.split(".")[1];
+    const fixed = base.replace(/-/g, "+").replace(/_/g, "/");
+    return JSON.parse(atob(fixed));
+  } catch {
+    return null;
+  }
+};
+const isTokenValid = () => {
+  const t = getToken();
+  if (!t) return false;
+  const p = parseJwt(t);
+  if (!p || !p.exp) return true; // jeśli brak exp, nie blokuj
+  // mały bufor, żeby nie odpalać requestów tuż przed wygaśnięciem
+  return Date.now() / 1000 < p.exp - 30;
+};
 
 export default function UnreadMessagesNotifier() {
   const navigate = useNavigate();
+  const { pathname } = useLocation();
 
-  // ile już pokazaliśmy dla danej rozmowy (ostatnie ID, dla którego był toast)
-  const lastToastRef = useRef({});     // { [convId]: lastMsgIdShown }
+  const lastToastRef = useRef({}); // { [convId]: lastMsgIdShown }
   const intervalRef = useRef(null);
-  const meRef = useRef(null);          // { id, username }
+  const meRef = useRef(null); // { id, username }
   const bootstrappedRef = useRef(false);
 
-  const getToken = () => localStorage.getItem(ACCESS_TOKEN);
-  const getActiveConvId = () =>
-    Number(localStorage.getItem("activeConversationId") || 0);
-
-  const norm = (s) => (s ?? "").toString().trim().toLowerCase();
+  // guard: nie uruchamiaj na stronach auth
+  const isAuthRoute = pathname === "/login" || pathname === "/register";
 
   const isFromMe = (msg) => {
     if (!msg || !meRef.current) return false;
@@ -30,27 +51,25 @@ export default function UnreadMessagesNotifier() {
 
     const candId = Number(
       msg?.sender_id ??
-      msg?.sender?.id ??
-      msg?.created_by_id ??
-      msg?.user_id ??
-      0
+        msg?.sender?.id ??
+        msg?.created_by_id ??
+        msg?.user_id ??
+        0
     );
     const candName = norm(
       msg?.sender_username ??
-      msg?.sender?.username ??
-      msg?.author ??
-      msg?.user?.username
+        msg?.sender?.username ??
+        msg?.author ??
+        msg?.user?.username
     );
 
     return (meId && candId && meId === candId) ||
-           (!!meName && !!candName && meName === candName);
+      (!!meName && !!candName && meName === candName);
   };
 
-  // stabilny tytuł rozmowy
   const computeTitle = (conv, last) => {
     if (conv.is_group) return conv.group_name || `Grupa #${conv.id}`;
 
-    // jeśli ostatnia nie jest nasza – pokaż nadawcę
     if (last && !isFromMe(last)) {
       const name =
         last?.sender_username ??
@@ -90,50 +109,65 @@ export default function UnreadMessagesNotifier() {
     navigate("/chat");
   };
 
+  // --- API helpers (wszystkie respektują token) ---
+  const authHeaders = () => {
+    const t = getToken();
+    return t ? { Authorization: `Bearer ${t}` } : {};
+  };
+
   async function fetchMe() {
-    const token = getToken();
-    if (!token) { meRef.current = null; return; }
+    if (!isTokenValid()) {
+      meRef.current = null;
+      return;
+    }
     try {
-      const { data } = await api.get("/api/me/", {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const { data } = await api.get("/api/me/", { headers: authHeaders() });
       meRef.current = {
         id: data?.id ?? data?.user?.id ?? null,
         username: data?.username ?? data?.user?.username ?? null,
       };
       if (DEBUG) console.debug("[Notifier] me =", meRef.current);
-    } catch {
+    } catch (e) {
+      // 401? – token nie działa → zatrzymaj polling i wyczyść kontekst
+      if (e?.response?.status === 401) {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      }
       meRef.current = null;
+      if (DEBUG) console.debug("[Notifier] /api/me 401 – stop polling");
     }
   }
 
   async function fetchConversations() {
-    const token = getToken();
-    const headers = { Authorization: `Bearer ${token}` };
-    const res = await api.get("/api/conversations/", { headers });
+    const res = await api.get("/api/conversations/", { headers: authHeaders() });
     const list = Array.isArray(res.data?.results)
       ? res.data.results
-      : Array.isArray(res.data) ? res.data : [];
-    const normalized = list.map((c) => ({
-      id: c.id ?? c.conversation_id ?? c.pk,
-      is_group: !!c.is_group,
-      group_name: c.group_name ?? c.title ?? c.name ?? null,
-      other_user: c.other_user || null,
-      participants: c.participants || c.users || [],
-    })).filter((c) => c.id != null);
+      : Array.isArray(res.data)
+      ? res.data
+      : [];
+    const normalized = list
+      .map((c) => ({
+        id: c.id ?? c.conversation_id ?? c.pk,
+        is_group: !!c.is_group,
+        group_name: c.group_name ?? c.title ?? c.name ?? null,
+        other_user: c.other_user || null,
+        participants: c.participants || c.users || [],
+      }))
+      .filter((c) => c.id != null);
     if (DEBUG) console.debug("[Notifier] convs =", normalized);
     return normalized;
   }
 
   async function fetchLastMessage(convId) {
-    const token = getToken();
-    const headers = { Authorization: `Bearer ${token}` };
-    const res = await api.get(`/api/chat/${convId}/`, { headers });
+    const res = await api.get(`/api/chat/${convId}/`, { headers: authHeaders() });
     const arr = Array.isArray(res.data?.results)
       ? res.data.results
-      : Array.isArray(res.data) ? res.data : [];
+      : Array.isArray(res.data)
+      ? res.data
+      : [];
     if (!arr.length) return null;
-
     // najnowsza po id (fallback po timestamp)
     let last = arr[0];
     for (const m of arr) if ((m.id ?? 0) > (last.id ?? 0)) last = m;
@@ -148,17 +182,17 @@ export default function UnreadMessagesNotifier() {
   }
 
   async function fetchUnread(convId) {
-    const token = getToken();
-    const headers = { Authorization: `Bearer ${token}` };
-    const res = await api.get(`/api/chat/${convId}/unread/`, { headers });
+    const res = await api.get(`/api/chat/${convId}/unread/`, {
+      headers: authHeaders(),
+    });
     const v = res.data;
-    // backend może zwrócić liczbę lub { unread: X } / { count: X }
-    return typeof v === "number" ? v : (v?.unread ?? v?.count ?? 0);
+    return typeof v === "number" ? v : v?.unread ?? v?.count ?? 0;
   }
 
   async function poll() {
-    const token = getToken();
-    if (!token) return;
+    // twarde gardy – bez nich nie wywołujemy backendu
+    if (isAuthRoute) return;
+    if (!isTokenValid()) return;
 
     if (!meRef.current) {
       await fetchMe();
@@ -168,7 +202,7 @@ export default function UnreadMessagesNotifier() {
     try {
       const convs = await fetchConversations();
 
-      // Pierwszy przebieg: tylko zapamiętaj ID ostatniej wiadomości, żeby nie wyskoczyły stare
+      // Pierwszy przebieg – zapamiętaj ostatnie ID, żeby nie strzelały stare toasty
       if (!bootstrappedRef.current) {
         const lastOfAll = await Promise.all(
           convs.map(async (c) => ({ conv: c, last: await fetchLastMessage(c.id) }))
@@ -185,11 +219,9 @@ export default function UnreadMessagesNotifier() {
       // Normalna praca
       for (const conv of convs) {
         const pageVisible = !document.hidden && document.hasFocus();
-        const activeConv = getActiveConvId();
+        const activeConv = Number(localStorage.getItem("activeConversationId") || 0);
         const isActiveHere = pageVisible && activeConv === Number(conv.id);
-
-        // nie powiadamiaj o otwartej rozmowie
-        if (isActiveHere) continue;
+        if (isActiveHere) continue; // nie powiadamiaj o otwartej rozmowie
 
         const [unread, last] = await Promise.all([
           fetchUnread(conv.id),
@@ -197,9 +229,7 @@ export default function UnreadMessagesNotifier() {
         ]);
 
         if (!last) continue;
-
-        // jeśli ostatnia wiadomość jest nasza – ignoruj (i tak unread powinno być 0)
-        if (isFromMe(last)) continue;
+        if (isFromMe(last)) continue; // nasza wiadomość – nie powiadamiaj
 
         const lastId = Number(last.id || 0);
         const alreadyShown = Number(lastToastRef.current[conv.id] || 0);
@@ -215,7 +245,6 @@ export default function UnreadMessagesNotifier() {
           });
         }
 
-        // pokaż TYLKO gdy są nieprzeczytane i mamy nową ostatnią, której jeszcze nie pokazywaliśmy
         if (unread > 0 && lastId > alreadyShown) {
           const title = computeTitle(conv, last);
           const preview = (last?.text ?? last?.content ?? "")
@@ -223,40 +252,64 @@ export default function UnreadMessagesNotifier() {
             .slice(0, 120);
           const tid = `newmsg-${conv.id}-${lastId}`;
 
-          toast.info(
-            `${title}: Nowa wiadomość${preview ? `\n${preview}` : ""}`,
-            {
-              toastId: tid,
-              onClick: () => { openInChat(conv); toast.dismiss(tid); },
-            }
-          );
+          toast.info(`${title}: Nowa wiadomość${preview ? `\n${preview}` : ""}`, {
+            toastId: tid,
+            onClick: () => {
+              openInChat(conv);
+              toast.dismiss(tid);
+            },
+          });
 
-          lastToastRef.current[conv.id] = lastId; // pamiętaj, że już pokazaliśmy
+          lastToastRef.current[conv.id] = lastId;
         }
       }
     } catch (e) {
-      if (DEBUG) console.debug("[Notifier] poll error", e);
+      // Na 401 przerywamy polling, bo użytkownik nie jest zalogowany/ma zły token
+      if (e?.response?.status === 401) {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+        meRef.current = null;
+        bootstrappedRef.current = false;
+        if (DEBUG) console.debug("[Notifier] 401 in poll – stop until re-login");
+      } else if (DEBUG) {
+        console.debug("[Notifier] poll error", e);
+      }
     }
   }
 
   useEffect(() => {
+    // jeśli jesteśmy na /login lub /register – nie montuj w ogóle
+    if (isAuthRoute) return;
+
+    // start tylko z ważnym tokenem
+    if (!isTokenValid()) return;
+
+    let canceled = false;
+
     (async () => {
       await fetchMe();
-      await poll();
-      intervalRef.current = setInterval(poll, POLL_MS);
+      if (!canceled && meRef.current) {
+        await poll();
+        intervalRef.current = setInterval(poll, POLL_MS);
+      }
     })();
 
     const onVis = () => {
       if (document.hidden) {
-        if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
-      } else if (!intervalRef.current && getToken()) {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      } else if (!intervalRef.current && isTokenValid()) {
         poll();
         intervalRef.current = setInterval(poll, POLL_MS);
       }
     };
     document.addEventListener("visibilitychange", onVis);
 
-    // po „seen” zsynchronizuj ostatnio pokazane id dla rozmowy
+    // zsynchronizuj ostatnio pokazane id po „seen”
     const onSeen = (e) => {
       const { convId, lastId } = e.detail || {};
       if (!convId) return;
@@ -266,15 +319,17 @@ export default function UnreadMessagesNotifier() {
     };
     window.addEventListener("chat:lastSeenUpdated", onSeen);
 
-    // login/logout – reset
     const onStorage = () => {
-      if (!getToken()) {
-        if (intervalRef.current) { clearInterval(intervalRef.current); intervalRef.current = null; }
+      if (!isTokenValid()) {
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
         meRef.current = null;
         lastToastRef.current = {};
         bootstrappedRef.current = false;
       } else if (!intervalRef.current) {
-        bootstrappedRef.current = false; // zrób bootstrap po zalogowaniu
+        bootstrappedRef.current = false;
         poll();
         intervalRef.current = setInterval(poll, POLL_MS);
       }
@@ -282,12 +337,14 @@ export default function UnreadMessagesNotifier() {
     window.addEventListener("storage", onStorage);
 
     return () => {
+      canceled = true;
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("chat:lastSeenUpdated", onSeen);
       window.removeEventListener("storage", onStorage);
       if (intervalRef.current) clearInterval(intervalRef.current);
     };
-  }, [navigate]);
+    
+  }, [pathname, navigate]);
 
   return null;
 }
