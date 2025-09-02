@@ -1,6 +1,10 @@
 import React, { useState, useEffect } from "react";
 import { ACCESS_TOKEN } from "../constants";
 import api from "../api";
+import { toast } from "react-toastify";
+
+const toList = (d) =>
+  Array.isArray(d) ? d : Array.isArray(d?.results) ? d.results : [];
 
 export default function EditModal({
   item,
@@ -15,6 +19,8 @@ export default function EditModal({
   const [users, setUsers] = useState([]);
   const [comments, setComments] = useState([]);
   const [newComment, setNewComment] = useState("");
+  const [newAttachment, setNewAttachment] = useState(null);
+  const [fileKey, setFileKey] = useState(0);
 
   useEffect(() => {
     if (item) {
@@ -24,7 +30,7 @@ export default function EditModal({
           const res = await api.get(`/api/tasks/${item.id}/comments/`, {
             headers: { Authorization: `Bearer ${token}` },
           });
-          setComments(res.data);
+          setComments(toList(res.data));
         } catch (err) {
           console.error("Błąd pobierania komentarzy:", err);
         }
@@ -62,22 +68,78 @@ export default function EditModal({
     fetchCurrentUser();
   }, []);
 
+  const clearAttachment = () => {
+    setNewTask((p) => ({ ...p, attachment: null }));
+    setFileKey((k) => k + 1); // <- remount
+  };
+
   const isAdmin = currentUser?.is_staff === true;
 
   const handleSave = async () => {
     try {
       const token = localStorage.getItem(ACCESS_TOKEN);
-      const payload = {
-        ...item,
-      };
-      await api.put(`/api/tasks/${item.id}/`, payload, {
+      const fd = new FormData();
+
+      // — teksty
+      if (item.title != null) fd.append("title", String(item.title));
+      if (item.description != null)
+        fd.append("description", String(item.description));
+      if (item.priority != null) fd.append("priority", String(item.priority));
+      if (item.status != null) fd.append("status", String(item.status)); // pomiń jeśli status ustala backend
+
+      // — bool jako string
+      if (typeof item.is_completed === "boolean") {
+        fd.append("is_completed", item.is_completed ? "true" : "false");
+      }
+
+      // — assigned_to: ID
+      if (item.assigned_to != null && item.assigned_to !== "") {
+        fd.append("assigned_to", String(item.assigned_to));
+      }
+
+      // — deadline → ISO
+      const rawDl = item.deadline;
+      if (rawDl) {
+        let iso = null;
+        if (typeof rawDl === "string") {
+          // jeśli z <input type="datetime-local"> dostajesz "YYYY-MM-DDTHH:mm"
+          const s = rawDl.includes(" ") ? rawDl.replace(" ", "T") : rawDl;
+          const d = new Date(s);
+          if (!isNaN(d)) iso = d.toISOString();
+        } else if (rawDl instanceof Date && !isNaN(rawDl)) {
+          iso = rawDl.toISOString();
+        }
+        if (iso) fd.append("deadline", iso);
+      }
+
+      // — nowy plik
+      if (newAttachment) {
+        fd.append("attachment", newAttachment);
+      }
+
+      await api.patch(`/api/tasks/${item.id}/`, fd, {
         headers: { Authorization: `Bearer ${token}` },
+        // Content-Type nie ustawiamy ręcznie
       });
 
-      if (onSave) onSave(); // np. odświeżenie listy w rodzicu
-      onCancel(); // zamknięcie modala
+      toast.success("✅ Zapisano zmiany");
+      onSave?.();
+      onCancel();
     } catch (err) {
-      console.error("Błąd podczas zapisywania zmian:", err);
+      const data = err?.response?.data || {};
+
+      // Priorytetowo pokaż precyzyjny komunikat z DRF:
+      if (Array.isArray(data.deadline) && data.deadline[0]) {
+        toast.error(data.deadline[0]);
+      } else if (Array.isArray(data.title) && data.title[0]) {
+        toast.error(data.title[0]);
+      } else if (typeof data.detail === "string") {
+        toast.error(data.detail);
+      } else {
+        toast.error("Nie zapisano zmian. Sprawdź formularz.");
+      }
+
+      console.error("Błąd podczas zapisywania zmian:", data);
     }
   };
 
@@ -154,6 +216,65 @@ export default function EditModal({
                 )}
               </div>
             ))}
+
+            <div className="mb-3">
+              <label className="form-label">Załącznik</label>
+
+              <input
+                key={fileKey}
+                type="file"
+                className="form-control"
+                onChange={(e) => setNewAttachment(e.target.files?.[0] || null)}
+              />
+
+              {/* 👇 JEDEN warunek zamiast dwóch */}
+              <div className="form-text mt-1">
+                {item?.attachment ? (
+                  <>
+                    📎{" "}
+                    <a
+                      href={
+                        item.attachment.startsWith("http")
+                          ? item.attachment
+                          : `${process.env.REACT_APP_API_URL}${item.attachment}`
+                      }
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      {item.attachment.split("/").pop()}
+                    </a>
+                    {" · "}
+                    <button
+                      type="button"
+                      className="btn btn-link btn-sm text-danger p-0"
+                      onClick={async () => {
+                        try {
+                          const token = localStorage.getItem(ACCESS_TOKEN);
+                          await api.delete(
+                            `/api/tasks/${item.id}/attachment/`,
+                            {
+                              headers: { Authorization: `Bearer ${token}` },
+                            }
+                          );
+                          onChange({ ...item, attachment: null });
+                          setNewAttachment(null);
+                          setFileKey((k) => k + 1);
+                          toast.success("Załącznik usunięty");
+                        } catch (e) {
+                          toast.error("Nie udało się usunąć załącznika");
+                        }
+                      }}
+                    >
+                      Usuń
+                    </button>
+                  </>
+                ) : newAttachment ? (
+                  <>Wybrano nowy plik: {newAttachment.name}</>
+                ) : (
+                  <>Brak załącznika</>
+                )}
+              </div>
+            </div>
           </div>
 
           <div className="modal-footer">
@@ -175,11 +296,11 @@ export default function EditModal({
 
           <div className="mt-3 px-3 pb-3">
             <h6>Komentarze</h6>
-            {comments.length === 0 ? (
+            {(comments || []).length === 0 ? (
               <p className="text-muted">Brak komentarzy.</p>
             ) : (
               <ul className="list-group">
-                {comments.map((comment) => (
+                {(comments || []).map((comment) => (
                   <li key={comment.id} className="list-group-item">
                     <strong>{comment.author_username}:</strong>{" "}
                     {comment.content}
